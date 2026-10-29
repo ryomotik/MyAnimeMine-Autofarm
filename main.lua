@@ -1,6 +1,6 @@
 --[[
     ═══════════════════════════════════════════════════════════════
-    ⛏️ [Моя аниме-шахта / My Anime Mine] — Ultimate Autofarm Hub v2.0
+    ⛏️ [Моя аниме-шахта / My Anime Mine] — Ultimate Autofarm Hub v2.1
     👑 Author: Ryomotik
     💎 UI: Fluent Amethyst Edition
     🎮 Place ID: 79389059854988
@@ -21,6 +21,10 @@ local MineConfig = require(ReplicatedStorage.Modules:WaitForChild("MineConfig"))
 local MineInventory = require(ReplicatedStorage.Modules:WaitForChild("MineInventory"))
 local String = require(ReplicatedStorage.Modules:WaitForChild("String"))
 local Items = require(ReplicatedStorage.Modules:WaitForChild("Items"))
+local MineStock = nil
+pcall(function()
+    MineStock = require(ReplicatedStorage.Modules:WaitForChild("MineStock"))
+end)
 
 -- Load Fluent Interface Suite
 local Fluent = nil
@@ -62,10 +66,11 @@ local State = {
     AutoSellInterval = 45,
     AutoSellInProgress = false,
     
-    -- Upgrades
-    AutoUpgradeMiners = false,
-    AutoUpgradeSkills = false,
-    AutoBuyPickaxes = false,
+    -- Upgrades & Progress
+    AutoUpgradeSkills = true,
+    AutoUpgradeMiners = true,
+    AutoBuyPickaxes = true,
+    AutoUnlockZones = true,
     
     -- Internal
     PlayerPlot = nil,
@@ -157,7 +162,32 @@ local function triggerSwingAnim()
     end)
 end
 
--- Routine: Take from Chest & Equip Best Dropped Characters
+-- Helper: Find highest owned pickaxe by name
+local function getBestOwnedPickaxe()
+    local data = GameState.GetData2()
+    local mg = data and data.MineGame
+    if not mg or not mg.Pickaxes then return nil end
+    
+    local pickaxeOrder = {}
+    for i, p in ipairs(MineConfig.Pickaxes or {}) do
+        pickaxeOrder[p.Name] = i
+    end
+    
+    local bestName = nil
+    local bestIdx = 0
+    for pickName, count in pairs(mg.Pickaxes) do
+        if count and count > 0 then
+            local idx = pickaxeOrder[pickName] or 0
+            if idx > bestIdx then
+                bestIdx = idx
+                bestName = pickName
+            end
+        end
+    end
+    return bestName
+end
+
+-- Routine: Take from Chest, Equip Best Dropped Characters & Best Pickaxes
 local function performCollectAndEquipBest()
     pcall(function()
         local pg = LocalPlayer:FindFirstChild("PlayerGui")
@@ -189,14 +219,145 @@ local function performCollectAndEquipBest()
         end
         task.wait(0.2)
         
-        -- Step 3: Equip highest pickaxe to all miners
+        -- Step 3: Equip highest owned pickaxe to all miners in slots
         local data = GameState.GetData2()
         local mg = data and data.MineGame
-        local tier = mg and mg.PickaxeTier or 1
+        local holders = mg and mg.Holders
+        local bestPick = getBestOwnedPickaxe()
+        if holders and bestPick then
+            for hKey, h in pairs(holders) do
+                if h.Pickaxe ~= bestPick then
+                    GameState.SendEvent("MineEquipPickaxe", hKey, bestPick)
+                    task.wait(0.04)
+                end
+            end
+        end
+    end)
+end
+
+-- Helper: Full Skill Tree Upgrades (Core & All Unlocked Zones)
+local function performUpgradeSkills()
+    local totalUpgraded = 0
+    pcall(function()
+        local data = GameState.GetData2()
+        local mg = data and data.MineGame
+        if not mg then return end
+
+        -- 1. Upgrade Core Skills (Tap Damage and Miner Slots)
+        if MineConfig.CoreNodeById then
+            for id, node in pairs(MineConfig.CoreNodeById) do
+                local maxed = MineConfig.IsCoreNodeMaxed(mg, node)
+                local open = MineConfig.IsCoreNodeOpen(mg, node)
+                if not maxed and open then
+                    local upg = MineConfig.CoreUpgradeById[node.Family]
+                    local lvl = MineConfig.GetCoreLevel(mg, node.Family)
+                    local cost = upg and upg.Cost and upg.Cost(lvl) or 0
+                    if data.Money >= cost and upg and upg.Event then
+                        GameState.SendEvent(upg.Event)
+                        totalUpgraded = totalUpgraded + 1
+                        task.wait(0.05)
+                        data = GameState.GetData2()
+                        mg = data and data.MineGame
+                    end
+                end
+            end
+        end
+
+        -- 2. Upgrade Zone Skills across ALL Unlocked Zones
+        local unlocked = mg and mg.UnlockedZones or {}
+        for zoneKey in pairs(unlocked) do
+            local zNodes = MineConfig.ZoneSkillNodes and MineConfig.ZoneSkillNodes[zoneKey]
+            if zNodes then
+                local zSkills = mg.Skills and mg.Skills[zoneKey] or {}
+                for _, node in ipairs(zNodes) do
+                    local maxed = MineConfig.IsSkillNodeMaxed(zSkills, node)
+                    local open = MineConfig.IsSkillNodeOpen(zSkills, node)
+                    if not maxed and open then
+                        local curLvl = zSkills[node.Family] or 0
+                        local cost = MineConfig.GetSkillCost and MineConfig.GetSkillCost(zoneKey, node.Family, curLvl + 1) or 0
+                        if data.Money >= cost then
+                            GameState.SendEvent("MineBuySkill", zoneKey, node.Family, node.Id)
+                            totalUpgraded = totalUpgraded + 1
+                            task.wait(0.05)
+                            data = GameState.GetData2()
+                            mg = data and data.MineGame
+                            zSkills = mg and mg.Skills and mg.Skills[zoneKey] or {}
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return totalUpgraded
+end
+
+-- Helper: Auto-Buy Best Pickaxes in Stock & Equip
+local function performAutoBuyPickaxes()
+    pcall(function()
+        local data = GameState.GetData2()
+        local mg = data and data.MineGame
+        if not mg or not MineStock then return end
+        local unlocked = mg.UnlockedZones or {}
+        
+        -- Buy highest affordable pickaxe currently in shop stock
+        for i = #(MineConfig.Pickaxes or {}), 1, -1 do
+            local p = MineConfig.Pickaxes[i]
+            if p and (not p.ZoneReq or unlocked[p.ZoneReq]) then
+                local remaining = MineStock.GetRemaining(data, p.Name) or 0
+                if remaining > 0 and data.Money >= (p.Cost or 0) then
+                    GameState.SendEvent("MineBuyPickaxe", i)
+                    task.wait(0.1)
+                    break
+                end
+            end
+        end
+        
+        -- Equip highest owned pickaxe across all miners
+        local bestPick = getBestOwnedPickaxe()
+        local holders = mg.Holders
+        if bestPick and holders then
+            for hKey, h in pairs(holders) do
+                if h.Pickaxe ~= bestPick then
+                    GameState.SendEvent("MineEquipPickaxe", hKey, bestPick)
+                    task.wait(0.04)
+                end
+            end
+        end
+    end)
+end
+
+-- Helper: Auto-Unlock Next Zone
+local function performAutoUnlockZones()
+    pcall(function()
+        local data = GameState.GetData2()
+        local mg = data and data.MineGame
+        if not mg then return end
+        local curZoneNum = mg.CurrentZone or 1
+        local nextZoneKey = "Z" .. tostring(curZoneNum + 1)
+        local nextZoneDef = MineConfig.Zones and MineConfig.Zones[nextZoneKey]
+        if nextZoneDef and nextZoneDef.UnlockCost then
+            if data.Money >= nextZoneDef.UnlockCost then
+                GameState.SendEvent("MineSelectZone", nextZoneKey)
+                notify("🗺️ Новая зона!", "Открыта и выбрана зона: " .. (nextZoneDef.DisplayName or nextZoneKey), 3.5)
+            end
+        end
+    end)
+end
+
+-- Helper: Upgrade All Miners Stats
+local function performUpgradeMiners()
+    pcall(function()
+        local data = GameState.GetData2()
+        local mg = data and data.MineGame
         local holders = mg and mg.Holders
         if holders then
             for hKey in pairs(holders) do
-                GameState.SendEvent("MineEquipPickaxe", hKey, tier)
+                GameState.SendEvent("MineUpgradeCharacter", hKey, "Damage")
+                task.wait(0.03)
+                GameState.SendEvent("MineUpgradeCharacter", hKey, "Speed")
+                task.wait(0.03)
+                GameState.SendEvent("MineUpgradeCharacter", hKey, "MineSpeed")
+                task.wait(0.03)
             end
         end
     end)
@@ -250,23 +411,25 @@ local function performFullSell()
             task.wait(0.5)
         end
 
-        -- 4. Click Select All & Sell
+        -- 4. Click SelectAll & SellButton
         local sellFrame = mineGui:FindFirstChild("SellFrame")
-        if sellFrame and sellFrame.Visible then
-            local content = sellFrame:FindFirstChild("Content")
-            if content then
-                local selectAll = content:FindFirstChild("SelectAllButton")
-                local sellBtn = content:FindFirstChild("SellButton")
-                if selectAll and sellBtn then
-                    firesignal(selectAll.MouseButton1Click)
+        if sellFrame and sellFrame:FindFirstChild("Content") then
+            local actions = sellFrame.Content:FindFirstChild("Actions")
+            if actions then
+                local selAll = actions:FindFirstChild("SelectAllButton")
+                if selAll then
+                    firesignal(selAll.MouseButton1Click)
                     task.wait(0.2)
+                end
+                local sellBtn = actions:FindFirstChild("SellButton")
+                if sellBtn then
                     firesignal(sellBtn.MouseButton1Click)
-                    task.wait(0.4)
+                    task.wait(0.3)
                 end
             end
         end
 
-        -- 5. Teleport back to Base
+        -- 5. Return to Base
         teleportTo("Base")
         task.wait(0.5)
     end)
@@ -275,74 +438,71 @@ local function performFullSell()
 end
 
 -- ─────────────────────────────────────────────────────────────
--- CREATE FLUENT UI WINDOW
+-- FLUENT UI SETUP
 -- ─────────────────────────────────────────────────────────────
 local Window = Fluent:CreateWindow({
-    Title = "⛏️ My Anime Mine | Hub v2.0",
+    Title = "⛏️ Моя аниме-шахта | Ultimate Hub",
     SubTitle = "by Ryomotik",
     TabWidth = 160,
-    Size = UDim2.fromOffset(590, 480),
-    Acrylic = true,
+    Size = UDim2.fromOffset(600, 480),
     Theme = "Amethyst",
     MinimizeKey = Enum.KeyCode.LeftControl
 })
 
 local Tabs = {
-    Farm = Window:AddTab({ Title = "Фарм", Icon = "pickaxe" }),
-    Clicker = Window:AddTab({ Title = "Автокликер", Icon = "mouse-pointer" }),
-    Pets = Window:AddTab({ Title = "Петы & Кирки", Icon = "users" }),
-    Sell = Window:AddTab({ Title = "Продажа", Icon = "coins" }),
-    Upgrade = Window:AddTab({ Title = "Прокачка", Icon = "zap" }),
-    Stats = Window:AddTab({ Title = "Инфо", Icon = "bar-chart-2" }),
+    Main     = Window:AddTab({ Title = "Автофарм", Icon = "flame" }),
+    Clicker  = Window:AddTab({ Title = "Автокликер", Icon = "mouse-pointer" }),
+    Pets     = Window:AddTab({ Title = "Петы & Кирки", Icon = "users" }),
+    Sell     = Window:AddTab({ Title = "Продажа", Icon = "banknote" }),
+    Upgrade  = Window:AddTab({ Title = "Прокачка", Icon = "zap" }),
+    Stats    = Window:AddTab({ Title = "Инфо", Icon = "activity" }),
     Settings = Window:AddTab({ Title = "Настройки", Icon = "settings" })
 }
 
 -- ─────────────────────────────────────────────────────────────
--- TAB 1: AUTO FARM (ТУРБО-АВТОФАРМ УЧАСТКА)
+-- TAB 1: MAIN AUTOFARM (АВТОФАРМ УЧАСТКА)
 -- ─────────────────────────────────────────────────────────────
-Tabs.Farm:AddSection("⚡ Турбо-Автофарм Участка")
+Tabs.Main:AddSection("⚡ Турбо-Автофарм Участка")
 
-Tabs.Farm:AddToggle("AutoFarmToggle", {
-    Title = "Турбо-Автофарм (Все камни на участке)",
-    Description = "Автоматически и непрерывно разбивает все спавнящиеся камни на вашем участке",
+Tabs.Main:AddToggle("AutoFarmToggle", {
+    Title = "Включить автофарм всех руд на участке",
+    Description = "Непрерывно бьёт все жилы руды пакетными ударами прямо на вашем участке",
     Default = false,
     Callback = function(val)
         State.AutoFarm = val
         if val then
-            notify("Автофарм", "Турбо-добыча активирована!", 2)
-        else
-            notify("Автофарм", "Добыча остановлена.", 2)
+            notify("Автофарм", "Турбо-автофарм запущен!", 2)
         end
     end
 })
 
-Tabs.Farm:AddSlider("FarmSpeedSlider", {
-    Title = "Ударов за такт (Интенсивность)",
-    Description = "Сколько раз кликать по жиле за каждый цикл (рекомендуется 5-15)",
-    Default = 10,
+Tabs.Main:AddSlider("FarmSpeedSlider", {
+    Title = "Ударов за такт (Multi-Hit)",
+    Description = "Количество кликов за каждый проход по камню (быстро крошит даже жилы с 1M+ HP)",
+    Default = 15,
     Min = 1,
-    Max = 30,
+    Max = 40,
     Rounding = 0,
     Callback = function(val)
         State.FarmSpeed = val
     end
 })
 
-Tabs.Farm:AddSlider("FarmDelaySlider", {
+Tabs.Main:AddSlider("FarmDelaySlider", {
     Title = "Задержка цикла автофарма (сек)",
-    Description = "Пауза между циклами обхода рудных жил",
+    Description = "Интервал между полными проверками участка",
     Default = 0.05,
     Min = 0.01,
-    Max = 0.3,
+    Max = 0.5,
     Rounding = 2,
     Callback = function(val)
         State.FarmDelay = val
     end
 })
 
-Tabs.Farm:AddToggle("SwingAnimToggle", {
-    Title = "Анимация взмаха кирки",
-    Description = "Персонаж визуально машет киркой при автофарме и автоклике",
+Tabs.Main:AddToggle("SwingAnimToggle", {
+    Title = "Анимация удара киркой",
+    Description = "Воспроизводит реалистичный взмах персонажа при копании",
     Default = true,
     Callback = function(val)
         State.PlaySwingAnimation = val
@@ -350,27 +510,25 @@ Tabs.Farm:AddToggle("SwingAnimToggle", {
 })
 
 -- ─────────────────────────────────────────────────────────────
--- TAB 2: AUTOCLICKER (ПОЛНОЦЕННЫЙ АВТОКЛИКЕР МЫШИ)
+-- TAB 2: AUTOCLICKER (АВТОКЛИКЕР КУРСОРА / МЫШИ)
 -- ─────────────────────────────────────────────────────────────
-Tabs.Clicker:AddSection("🖱️ Автокликер Курсора / Мыши")
+Tabs.Clicker:AddSection("🖱️ Автокликер по курсору мыши")
 
 Tabs.Clicker:AddToggle("AutoClickerToggle", {
-    Title = "Включить Автокликер",
-    Description = "Быстро кликает по камню под прицелом/курсором или спамит ЛКМ",
+    Title = "Включить автокликер мыши",
+    Description = "Спамит кликами туда, куда наведён курсор (по руде или в пространство)",
     Default = false,
     Callback = function(val)
         State.AutoClicker = val
         if val then
-            notify("Автокликер", "Автокликер включён! Нажмите клавишу для переключения.", 2)
-        else
-            notify("Автокликер", "Автокликер выключен.", 2)
+            notify("Автокликер", "Автокликер активирован!", 2)
         end
     end
 })
 
 Tabs.Clicker:AddSlider("ClickerCPSSlider", {
-    Title = "Кликов в секунду (CPS)",
-    Description = "Скорость работы автокликера",
+    Title = "Скорость кликов (CPS)",
+    Description = "Кликов в секунду (рекомендуется 20-30 для максимальной скорости копки)",
     Default = 25,
     Min = 5,
     Max = 50,
@@ -397,23 +555,23 @@ Tabs.Pets:AddSection("🐾 Авто-сбор и экипировка сильн�
 
 Tabs.Pets:AddToggle("AutoEquipBestToggle", {
     Title = "Авто-сбор и экипировка топ петов",
-    Description = "Каждые 5 сек забирает сундук и надевает самых сильных выпавших аниме-персов",
+    Description = "Каждые 5 сек забирает сундук, надевает лучших выпавших аниме-персов и выдаёт топ кирки",
     Default = true,
     Callback = function(val)
         State.AutoEquipBest = val
         if val then
             performCollectAndEquipBest()
-            notify("Петы", "Авто-экипировка лучших петов включена!", 2)
+            notify("Петы", "Авто-экипировка включена!", 2)
         end
     end
 })
 
 Tabs.Pets:AddButton({
     Title = "⚡ Забрать сундук и одеть ТОП петов сейчас",
-    Description = "Мгновенно достаёт всех выпавших петов из сундука и ставит их в слоты",
+    Description = "Мгновенно опустошает сундук, ставит сильнейших героев в слоты и даёт им лучшие кирки",
     Callback = function()
         performCollectAndEquipBest()
-        notify("Петы", "Сундук опустошён, лучшие персонажи экипированы!", 2.5)
+        notify("Петы", "Сундук опустошён, лучшие персонажи и кирки экипированы!", 2.5)
     end
 })
 
@@ -466,30 +624,74 @@ Tabs.Sell:AddButton({
 -- ─────────────────────────────────────────────────────────────
 Tabs.Upgrade:AddSection("⚡ Автоматическая прокачка")
 
-Tabs.Upgrade:AddToggle("AutoUpgradeMinersToggle", {
-    Title = "Авто-прокачка майнеров (Damage, Speed, Mining)",
-    Description = "Повышает уровни характеристик всех экипированных персонажей",
-    Default = false,
-    Callback = function(val)
-        State.AutoUpgradeMiners = val
-    end
-})
-
 Tabs.Upgrade:AddToggle("AutoUpgradeSkillsToggle", {
-    Title = "Авто-прокачка дерева навыков (Skill Tree)",
-    Description = "Изучает доступные навыки текущей зоны по мере накопления монет",
-    Default = false,
+    Title = "Авто-прокачка дерева навыков (Skill Tree & Core)",
+    Description = "Изучает все открытые навыки во всех зонах и ядре (Core Tap/Slots) при наличии монет",
+    Default = true,
     Callback = function(val)
         State.AutoUpgradeSkills = val
     end
 })
 
+Tabs.Upgrade:AddButton({
+    Title = "🌟 Прокачать все доступные навыки сейчас",
+    Description = "Мгновенно покупает все доступные навыки во всех открытых зонах и ядре",
+    Callback = function()
+        local count = performUpgradeSkills()
+        notify("Древо навыков", "Успешно изучено новых навыков: " .. tostring(count), 3)
+    end
+})
+
+Tabs.Upgrade:AddToggle("AutoUpgradeMinersToggle", {
+    Title = "Авто-прокачка майнеров (Damage, Speed, Mining)",
+    Description = "Повышает уровни характеристик всех экипированных персонажей",
+    Default = true,
+    Callback = function(val)
+        State.AutoUpgradeMiners = val
+    end
+})
+
+Tabs.Upgrade:AddButton({
+    Title = "💪 Прокачать характеристики майнеров сейчас",
+    Description = "Улучшает урон, скорость и скорость копки всех персонажей в слотах",
+    Callback = function()
+        performUpgradeMiners()
+        notify("Майнеры", "Характеристики майнеров успешно прокачаны!", 2)
+    end
+})
+
 Tabs.Upgrade:AddToggle("AutoBuyPickaxesToggle", {
-    Title = "Авто-покупка лучших кирок (Pickaxe Shop)",
-    Description = "Покупает кирку следующего уровня в магазине при наличии средств",
-    Default = false,
+    Title = "Авто-покупка и экипировка лучших кирок",
+    Description = "Скупает лучшие кирки в магазине при наличии средств и выдаёт их всем майнерам",
+    Default = true,
     Callback = function(val)
         State.AutoBuyPickaxes = val
+    end
+})
+
+Tabs.Upgrade:AddButton({
+    Title = "⛏️ Купить лучшую кирку и выдать всем майнерам",
+    Description = "Покупает мощнейшую доступную кирку и экипирует её на всех героев в слотах",
+    Callback = function()
+        performAutoBuyPickaxes()
+        notify("Кирки", "Лучшие кирки куплены и выданы майнерам!", 2.5)
+    end
+})
+
+Tabs.Upgrade:AddToggle("AutoUnlockZonesToggle", {
+    Title = "Авто-открытие новых зон (Auto Unlock Zones)",
+    Description = "Автоматически открывает и активирует следующую зону при накоплении нужной суммы",
+    Default = true,
+    Callback = function(val)
+        State.AutoUnlockZones = val
+    end
+})
+
+Tabs.Upgrade:AddButton({
+    Title = "🗺️ Проверить и открыть следующую зону",
+    Description = "Покупает и активирует новую зону, если хватает монет",
+    Callback = function()
+        performAutoUnlockZones()
     end
 })
 
@@ -518,7 +720,7 @@ Tabs.Settings:AddKeybind("ToggleMenuKeybind", {
 Tabs.Settings:AddSection("👑 Создатель")
 Tabs.Settings:AddParagraph({
     Title = "Разработчик скрипта",
-    Content = "Автор: Ryomotik\nСпециально для: «⛏️ Моя аниме-шахта» (My Anime Mine)\nВерсия: v2.0 Turbo Edition"
+    Content = "Автор: Ryomotik\nСпециально для: «⛏️ Моя аниме-шахта» (My Anime Mine)\nВерсия: v2.1 Turbo Edition"
 })
 
 -- ─────────────────────────────────────────────────────────────
@@ -598,64 +800,42 @@ task.spawn(function()
     while true do
         task.wait(4)
         if State.AutoUpgradeMiners and not State.AutoSellInProgress then
-            pcall(function()
-                local data = GameState.GetData2()
-                local mg = data and data.MineGame
-                local holders = mg and mg.Holders
-                if holders then
-                    for hKey in pairs(holders) do
-                        if not State.AutoUpgradeMiners then break end
-                        GameState.SendEvent("MineUpgradeCharacter", hKey, "Damage")
-                        task.wait(0.04)
-                        GameState.SendEvent("MineUpgradeCharacter", hKey, "Speed")
-                        task.wait(0.04)
-                        GameState.SendEvent("MineUpgradeCharacter", hKey, "MineSpeed")
-                        task.wait(0.04)
-                    end
-                end
-            end)
+            performUpgradeMiners()
         end
     end
 end)
 
--- 6. Auto-Upgrade Skills Worker
+-- 6. Auto-Upgrade Skills Worker (Skill Tree & Core)
+task.spawn(function()
+    while true do
+        task.wait(4)
+        if State.AutoUpgradeSkills and not State.AutoSellInProgress then
+            performUpgradeSkills()
+        end
+    end
+end)
+
+-- 7. Auto-Buy & Equip Pickaxes Worker
 task.spawn(function()
     while true do
         task.wait(6)
-        if State.AutoUpgradeSkills and not State.AutoSellInProgress then
-            pcall(function()
-                local data = GameState.GetData2()
-                local mg = data and data.MineGame
-                local curZone = "Z" .. tostring(mg and mg.CurrentZone or 1)
-                local zNodes = MineConfig.ZoneSkillNodes and MineConfig.ZoneSkillNodes[curZone]
-                if zNodes then
-                    for _, node in ipairs(zNodes) do
-                        if not State.AutoUpgradeSkills then break end
-                        GameState.SendEvent("MineBuySkill", node.Id)
-                        task.wait(0.05)
-                    end
-                end
-            end)
+        if State.AutoBuyPickaxes and not State.AutoSellInProgress then
+            performAutoBuyPickaxes()
         end
     end
 end)
 
--- 7. Auto-Buy Pickaxes Worker
+-- 8. Auto-Unlock Next Zone Worker
 task.spawn(function()
     while true do
         task.wait(8)
-        if State.AutoBuyPickaxes and not State.AutoSellInProgress then
-            pcall(function()
-                local data = GameState.GetData2()
-                local mg = data and data.MineGame
-                local tier = mg and mg.PickaxeTier or 1
-                GameState.SendEvent("MineBuyPickaxe", tier + 1)
-            end)
+        if State.AutoUnlockZones and not State.AutoSellInProgress then
+            performAutoUnlockZones()
         end
     end
 end)
 
--- 8. Live Telemetry & Slot Display Updater
+-- 9. Live Telemetry & Slot Display Updater
 task.spawn(function()
     while true do
         pcall(function()
@@ -686,7 +866,8 @@ task.spawn(function()
                     local mult = MineConfig.GetCharacterLevelMultiplier(h.CharLevel or 1)
                     local totalDmg = math.floor(baseDmg * mult)
                     local fmtDmg = (String and String.ToMoney and pcall(String.ToMoney, String, totalDmg)) and String:ToMoney(totalDmg) or tostring(totalDmg)
-                    table.insert(slotLines, string.format("• [%s] %s | Lvl: %d | DMG: %s", k, h.CharName, h.CharLevel or 1, fmtDmg))
+                    local pick = h.Pickaxe or "Default"
+                    table.insert(slotLines, string.format("• [%s] %s | Lvl: %d | DMG: %s | ⛏️ %s", k, h.CharName, h.CharLevel or 1, fmtDmg, pick))
                 end
             end
             if #slotLines > 0 then
@@ -701,4 +882,4 @@ end)
 
 -- Default tab selection and ready notification
 Window:SelectTab(1)
-notify("⛏️ My Anime Mine Hub v2.0", "Готово! Автокликер [V] и авто-экипировка настроены.", 5)
+notify("⛏️ My Anime Mine Hub v2.1", "Готово! Древо навыков, автокликер [V] и авто-экипировка настроены.", 5)
